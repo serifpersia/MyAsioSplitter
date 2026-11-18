@@ -1,23 +1,26 @@
 #pragma once
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 
 #include <atomic>
 #include <bit>
 #include <cstdint>
 
-// 16,384 stereo frames = 32,768 interleaved floats.
 constexpr uint32_t kRingFrames = 16384;
 constexpr uint64_t kRingMask = kRingFrames - 1;
-static_assert((kRingFrames & (kRingFrames - 1)) == 0, "ring size must be a power of two");
+static_assert((kRingFrames & (kRingFrames - 1)) == 0);
 
 constexpr wchar_t kShmName[] = L"Local\\MyAsioSplitter_SHM";
 
 #pragma warning(push)
-#pragma warning(disable : 4324)  // intentional cache-line padding in the shared block
+#pragma warning(disable : 4324)
 struct ShmBlock {
-    // Written by the master during init/createBuffers and published with release
-    // stores; the slave reads them with acquire loads.
     std::atomic<uint32_t> masterPid;
     std::atomic<uint32_t> generation;
     std::atomic<uint32_t> masterStreaming;
@@ -26,7 +29,6 @@ struct ShmBlock {
     std::atomic<uint32_t> tapClients;
     std::atomic<uint64_t> sampleRateBits;
 
-    // Producer writes writeIdx only. Consumer writes readIdx only.
     alignas(64) std::atomic<uint64_t> writeIdx;
     alignas(64) std::atomic<uint64_t> readIdx;
 

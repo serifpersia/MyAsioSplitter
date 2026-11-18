@@ -5,11 +5,11 @@ stream of the application that owns the interface, without a virtual cable.
 
 One DLL registers two ASIO devices:
 
-- **MyASIO Splitter** — open this in the application that should own the
+- **MyASIO Splitter**: open this in the application that should own the
   hardware (for example Pianoteq). It forwards every call to the real ASIO
   driver selected in its control panel and publishes the audio to a lock-free
   shared-memory ring.
-- **MyASIO Splitter (Tap)** — open this in the capturing application (for
+- **MyASIO Splitter (Tap)**: open this in the capturing application (for
   example OBS through obs-asio). It exposes the same two input channels, paced
   from the master's clock and sample rate.
 
@@ -26,9 +26,10 @@ second application: two processes cannot own the same interface.
 
 ## Install
 
-Build first, then run `install.bat` as administrator. The script copies the
-DLL to `%ProgramFiles%\MyAsioSplitter` and registers both devices. Running it
-again offers reinstall or uninstall.
+Download the latest release zip, extract it, and run `install.bat` as
+administrator. The script copies the DLL to `%ProgramFiles%\MyAsioSplitter`
+and registers both devices. Running it again offers reinstall or uninstall.
+Building from source uses the same script after `cmake --build`.
 
 ## Usage
 
@@ -48,24 +49,24 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
 
+Or run `build.bat`.
+
 Outputs under `build\Release`:
 
-- `MyAsioSplitter.dll` — the driver
-- `MyAsioSplitterSmokeTest.exe` — COM/vtable/ring self-test
-- `MyAsioSplitterShmDump.exe` — read-only shared-memory inspector
+- `MyAsioSplitter.dll`: the driver
+- `MyAsioSplitterSmokeTest.exe`: COM/vtable/ring self-test
+- `MyAsioSplitterShmDump.exe`: read-only shared-memory inspector
 
 ## Notes
 
 - The tap drops frames instead of blocking the master.
-- 64-frame buffers work; 128 frames is a safer floor on USB interfaces.
 - The selected hardware driver is stored in
   `%APPDATA%\MyAsioSplitter\config.ini`.
 
 ## License
 
-MIT. See `LICENSE`.
+Distributed under the terms of the [MIT License](LICENSE).
 
-This project contains no Steinberg ASIO SDK code. `src/asio_abi.h` only
-declares the public binary interface needed for interoperability. ASIO is a
-trademark of Steinberg Media Technologies GmbH. This project is not affiliated
-with or endorsed by Steinberg.
+This project contains no Steinberg ASIO SDK code. ASIO is a trademark of
+Steinberg Media Technologies GmbH. This project is not affiliated with or
+endorsed by Steinberg.

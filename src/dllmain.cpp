@@ -1,11 +1,19 @@
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <unknwn.h>
 
 #include <avrt.h>
 #include <malloc.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <cwchar>
 #include <new>
@@ -17,13 +25,9 @@
 #include "config.h"
 #include "shm_ring.h"
 
-// Master entry (owns the hardware ASIO device).
-// {7C9E5B6A-3F2D-4C81-9E4A-5D6F8B1C2A30}
 static const CLSID CLSID_MyAsioSplitter =
     {0x7c9e5b6a, 0x3f2d, 0x4c81, {0x9e, 0x4a, 0x5d, 0x6f, 0x8b, 0x1c, 0x2a, 0x30}};
 
-// Tap entry (always slave capture; never touches hardware).
-// {9A4F2D18-6B3C-4E57-A1D0-2C8E7F4B9A61}
 static const CLSID CLSID_MyAsioSplitterTap =
     {0x9a4f2d18, 0x6b3c, 0x4e57, {0xa1, 0xd0, 0x2c, 0x8e, 0x7f, 0x4b, 0x9a, 0x61}};
 
@@ -45,8 +49,8 @@ static const DriverEntry kDrivers[] = {
 };
 
 static HINSTANCE g_hInstance = nullptr;
-static LONG g_driverRefs = 0;
-static LONG g_serverLocks = 0;
+static std::atomic<long> g_liveObjects{0};
+static std::atomic<long> g_serverLocks{0};
 
 static const DriverEntry* FindDriver(REFCLSID clsid) {
     for (const DriverEntry& entry : kDrivers) {
@@ -62,42 +66,118 @@ struct MasterOutChannel {
 
 static bool IsCommonSampleRate(double rate) {
     return std::fabs(rate - 44100.0) < 0.5 || std::fabs(rate - 48000.0) < 0.5 ||
-           std::fabs(rate - 88200.0) < 0.5 || std::fabs(rate - 96000.0) < 0.5;
+           std::fabs(rate - 88200.0) < 0.5 || std::fabs(rate - 96000.0) < 0.5 ||
+           std::fabs(rate - 176400.0) < 0.5 || std::fabs(rate - 192000.0) < 0.5;
+}
+
+static long NextPowerOfTwo(long value, long limit) {
+    long p = 1;
+    while (p < value && p < limit) p <<= 1;
+    return p > limit ? limit : p;
 }
 
 static float ClampSample(float value) {
-    return value < -1.0f ? -1.0f : (value > 1.0f ? 1.0f : value);
+    return (value > -1.0f) ? (value < 1.0f ? value : 1.0f) : (value <= -1.0f ? -1.0f : 0.0f);
 }
 
-static float ReadSampleAsFloat(ASIOSampleType type, const void* buffer, long index) {
+static void WriteChannelSamples(ASIOSampleType type, const void* src, long srcOffset,
+                                float* dst, long count) {
     switch (type) {
-        case ASIOSTInt16LSB:
-            return static_cast<float>(static_cast<const int16_t*>(buffer)[index]) / 32768.0f;
-        case ASIOSTInt24LSB: {
-            // ASIOSTInt24LSB is tightly packed 3 bytes, little-endian, NOT padded int32.
-            const auto* bytes = static_cast<const uint8_t*>(buffer) + static_cast<size_t>(index) * 3;
-            int32_t value = static_cast<int32_t>(bytes[0]) | (static_cast<int32_t>(bytes[1]) << 8) |
-                            (static_cast<int32_t>(bytes[2]) << 16);
-            if (value & 0x800000) value |= ~0xFFFFFF;
-            return static_cast<float>(value) / 8388608.0f;
+        case ASIOSTInt16LSB: {
+            const auto* in = static_cast<const int16_t*>(src) + srcOffset;
+            for (long i = 0; i < count; ++i) {
+                dst[i * 2] = static_cast<float>(in[i]) * (1.0f / 32768.0f);
+            }
+            break;
         }
-        case ASIOSTInt32LSB:
-            return static_cast<float>(static_cast<const int32_t*>(buffer)[index]) / 2147483648.0f;
-        case ASIOSTFloat32LSB:
-            return ClampSample(static_cast<const float*>(buffer)[index]);
-        default:
-            return 0.0f;
+        case ASIOSTInt24LSB: {
+            const auto* in = static_cast<const uint8_t*>(src) + static_cast<size_t>(srcOffset) * 3;
+            for (long i = 0; i < count; ++i) {
+                const uint8_t* p = in + static_cast<size_t>(i) * 3;
+                const uint32_t packed = static_cast<uint32_t>(p[0]) |
+                                        (static_cast<uint32_t>(p[1]) << 8) |
+                                        (static_cast<uint32_t>(p[2]) << 16);
+                const int32_t sample = static_cast<int32_t>(packed << 8) >> 8;
+                dst[i * 2] = static_cast<float>(sample) * (1.0f / 8388608.0f);
+            }
+            break;
+        }
+        case ASIOSTInt32LSB: {
+            const auto* in = static_cast<const int32_t*>(src) + srcOffset;
+            for (long i = 0; i < count; ++i) {
+                dst[i * 2] = static_cast<float>(in[i]) * (1.0f / 2147483648.0f);
+            }
+            break;
+        }
+        case ASIOSTInt32LSB16: {
+            const auto* in = static_cast<const int32_t*>(src) + srcOffset;
+            for (long i = 0; i < count; ++i) {
+                const int32_t sample = static_cast<int32_t>(static_cast<uint32_t>(in[i]) << 16) >> 16;
+                dst[i * 2] = static_cast<float>(sample) * (1.0f / 32768.0f);
+            }
+            break;
+        }
+        case ASIOSTInt32LSB18: {
+            const auto* in = static_cast<const int32_t*>(src) + srcOffset;
+            for (long i = 0; i < count; ++i) {
+                const int32_t sample = static_cast<int32_t>(static_cast<uint32_t>(in[i]) << 14) >> 14;
+                dst[i * 2] = static_cast<float>(sample) * (1.0f / 131072.0f);
+            }
+            break;
+        }
+        case ASIOSTInt32LSB20: {
+            const auto* in = static_cast<const int32_t*>(src) + srcOffset;
+            for (long i = 0; i < count; ++i) {
+                const int32_t sample = static_cast<int32_t>(static_cast<uint32_t>(in[i]) << 12) >> 12;
+                dst[i * 2] = static_cast<float>(sample) * (1.0f / 524288.0f);
+            }
+            break;
+        }
+        case ASIOSTInt32LSB24: {
+            const auto* in = static_cast<const int32_t*>(src) + srcOffset;
+            for (long i = 0; i < count; ++i) {
+                const int32_t sample = static_cast<int32_t>(static_cast<uint32_t>(in[i]) << 8) >> 8;
+                dst[i * 2] = static_cast<float>(sample) * (1.0f / 8388608.0f);
+            }
+            break;
+        }
+        case ASIOSTFloat32LSB: {
+            const auto* in = static_cast<const float*>(src) + srcOffset;
+            for (long i = 0; i < count; ++i) {
+                dst[i * 2] = ClampSample(in[i]);
+            }
+            break;
+        }
+        case ASIOSTFloat64LSB: {
+            const auto* in = static_cast<const double*>(src) + srcOffset;
+            for (long i = 0; i < count; ++i) {
+                dst[i * 2] = ClampSample(static_cast<float>(in[i]));
+            }
+            break;
+        }
+        default: {
+            for (long i = 0; i < count; ++i) {
+                dst[i * 2] = 0.0f;
+            }
+            break;
+        }
     }
+}
+
+static uint64_t QpcFrequency() {
+    static const uint64_t hz = []() {
+        LARGE_INTEGER freq = {};
+        QueryPerformanceFrequency(&freq);
+        return freq.QuadPart > 0 ? static_cast<uint64_t>(freq.QuadPart) : 1ULL;
+    }();
+    return hz;
 }
 
 static uint64_t QpcNanoseconds() {
     LARGE_INTEGER counter = {};
-    LARGE_INTEGER frequency = {};
     QueryPerformanceCounter(&counter);
-    QueryPerformanceFrequency(&frequency);
     const uint64_t ticks = static_cast<uint64_t>(counter.QuadPart);
-    const uint64_t hz = static_cast<uint64_t>(frequency.QuadPart);
-    if (hz == 0) return 0;
+    const uint64_t hz = QpcFrequency();
     return (ticks / hz) * 1000000000ULL + ((ticks % hz) * 1000000000ULL) / hz;
 }
 
@@ -108,7 +188,6 @@ public:
     MyAsioSplitter(const MyAsioSplitter&) = delete;
     MyAsioSplitter& operator=(const MyAsioSplitter&) = delete;
 
-    // ---- IUnknown ----
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) return E_POINTER;
         if (riid == IID_IUnknown || IsEqualGUID(riid, m_entry.clsid)) {
@@ -120,18 +199,28 @@ public:
         return E_NOINTERFACE;
     }
 
-    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&g_driverRefs)); }
-
-    ULONG STDMETHODCALLTYPE Release() override {
-        const LONG refs = InterlockedDecrement(&g_driverRefs);
-        if (refs == 0) shutdown();
-        return static_cast<ULONG>(refs < 0 ? 0 : refs);
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        const long refs = m_ref.fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (refs == 1) g_liveObjects.fetch_add(1, std::memory_order_acq_rel);
+        return static_cast<ULONG>(refs);
     }
 
-    // ---- IASIO (21 methods; with IUnknown that is exactly 24 vtable slots) ----
+    ULONG STDMETHODCALLTYPE Release() override {
+        const long refs = m_ref.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (refs == 0) {
+            shutdown();
+            g_liveObjects.fetch_sub(1, std::memory_order_acq_rel);
+            return 0;
+        }
+        if (refs < 0) {
+            m_ref.store(0, std::memory_order_release);
+            return 0;
+        }
+        return static_cast<ULONG>(refs);
+    }
+
     ASIOBool init(void* sysHandle) override {
         if (m_entry.role == DriverRole::Tap) return initTap();
-
         if (m_hwAsio) return ASIOTrue;
 
         const std::vector<AsioDriverInfo> drivers =
@@ -169,6 +258,7 @@ public:
             ShmBlock* block = m_shm.block();
             m_isPublisher = claimMaster();
             if (m_isPublisher && block) {
+                std::memset(block->samples, 0, sizeof(block->samples));
                 block->outputChannels.store(2, std::memory_order_relaxed);
                 block->bufferSize.store(0, std::memory_order_relaxed);
                 ASIOSampleRate rate = 0.0;
@@ -224,123 +314,124 @@ public:
     }
 
     ASIOError getChannels(long* numInputChannels, long* numOutputChannels) override {
-        if (m_hwAsio) return m_hwAsio->getChannels(numInputChannels, numOutputChannels);
-
-        if (numInputChannels) *numInputChannels = 2;
-        if (numOutputChannels) *numOutputChannels = 0;
-        return ASE_OK;
+        if (m_entry.role == DriverRole::Tap) {
+            if (numInputChannels) *numInputChannels = 2;
+            if (numOutputChannels) *numOutputChannels = 0;
+            return ASE_OK;
+        }
+        if (!m_hwAsio) return ASE_NotPresent;
+        return m_hwAsio->getChannels(numInputChannels, numOutputChannels);
     }
 
     ASIOError getLatencies(long* inputLatency, long* outputLatency) override {
-        if (m_hwAsio) return m_hwAsio->getLatencies(inputLatency, outputLatency);
-
-        if (inputLatency) *inputLatency = 0;
-        if (outputLatency) *outputLatency = 0;
-        return ASE_OK;
+        if (m_entry.role == DriverRole::Tap) {
+            if (inputLatency) *inputLatency = m_tapBufferSize;
+            if (outputLatency) *outputLatency = 0;
+            return ASE_OK;
+        }
+        if (!m_hwAsio) return ASE_NotPresent;
+        return m_hwAsio->getLatencies(inputLatency, outputLatency);
     }
 
     ASIOError getBufferSize(long* minSize, long* maxSize, long* preferredSize, long* granularity) override {
-        if (m_hwAsio) return m_hwAsio->getBufferSize(minSize, maxSize, preferredSize, granularity);
-
-        const long size = m_entry.role == DriverRole::Tap ? liveTapBufferSize() : 512;
-        if (minSize) *minSize = size;
-        if (maxSize) *maxSize = size;
-        if (preferredSize) *preferredSize = size;
-        if (granularity) *granularity = 0;
-        return ASE_OK;
+        if (m_entry.role == DriverRole::Tap) {
+            const long master = liveTapBufferSize();
+            const double rate = liveTapRate();
+            const long minSafe = (rate > 60000.0) ? 256L : 128L;
+            const long prefSafe = (rate > 60000.0) ? 512L : 256L;
+            const long maxBuf = 4096L;
+            const long prefBuf = (master > prefSafe) ? NextPowerOfTwo(master, maxBuf) : prefSafe;
+            if (minSize) *minSize = minSafe;
+            if (maxSize) *maxSize = maxBuf;
+            if (preferredSize) *preferredSize = prefBuf;
+            if (granularity) *granularity = -1;
+            return ASE_OK;
+        }
+        if (!m_hwAsio) return ASE_NotPresent;
+        return m_hwAsio->getBufferSize(minSize, maxSize, preferredSize, granularity);
     }
 
     ASIOError canSampleRate(ASIOSampleRate sampleRate) override {
-        if (m_hwAsio) return m_hwAsio->canSampleRate(sampleRate);
-
         if (m_entry.role == DriverRole::Tap) {
             if (tapMasterPresent()) {
                 return std::fabs(sampleRate - liveTapRate()) < 0.5 ? ASE_OK : ASE_NoClock;
             }
             return IsCommonSampleRate(sampleRate) ? ASE_OK : ASE_NoClock;
         }
-        return IsCommonSampleRate(sampleRate) ? ASE_OK : ASE_NoClock;
+        if (!m_hwAsio) return ASE_NotPresent;
+        return m_hwAsio->canSampleRate(sampleRate);
     }
 
     ASIOError getSampleRate(ASIOSampleRate* sampleRate) override {
-        if (m_hwAsio) return m_hwAsio->getSampleRate(sampleRate);
-
-        if (sampleRate) *sampleRate = (m_entry.role == DriverRole::Tap) ? liveTapRate() : m_sampleRate;
-        return ASE_OK;
+        if (m_entry.role == DriverRole::Tap) {
+            if (sampleRate) *sampleRate = liveTapRate();
+            return ASE_OK;
+        }
+        if (!m_hwAsio) return ASE_NotPresent;
+        return m_hwAsio->getSampleRate(sampleRate);
     }
 
     ASIOError setSampleRate(ASIOSampleRate sampleRate) override {
-        if (m_hwAsio) {
-            const ASIOError result = m_hwAsio->setSampleRate(sampleRate);
-            if (result == ASE_OK) publishRate(sampleRate);
-            return result;
+        if (m_entry.role == DriverRole::Tap) {
+            if (tapMasterPresent()) {
+                return std::fabs(sampleRate - liveTapRate()) < 0.5 ? ASE_OK : ASE_NoClock;
+            }
+            if (!IsCommonSampleRate(sampleRate)) return ASE_NoClock;
+            m_sampleRate = sampleRate;
+            return ASE_OK;
         }
-
-        if (m_entry.role == DriverRole::Tap && tapMasterPresent()) {
-            return std::fabs(sampleRate - liveTapRate()) < 0.5 ? ASE_OK : ASE_NoClock;
-        }
-        if (!IsCommonSampleRate(sampleRate)) return ASE_NoClock;
-        m_sampleRate = sampleRate;
-        return ASE_OK;
+        if (!m_hwAsio) return ASE_NotPresent;
+        const ASIOError result = m_hwAsio->setSampleRate(sampleRate);
+        if (result == ASE_OK) publishRate(sampleRate);
+        return result;
     }
 
     ASIOError getClockSources(ASIOClockSource* clocks, long* numSources) override {
-        if (m_hwAsio) return m_hwAsio->getClockSources(clocks, numSources);
-        if (m_entry.role != DriverRole::Tap) {
-            if (numSources) *numSources = 0;
+        if (m_entry.role == DriverRole::Tap) {
+            if (numSources) *numSources = 1;
+            if (clocks) {
+                ASIOClockSource source = {};
+                source.index = 0;
+                source.associatedChannel = -1;
+                source.associatedGroup = -1;
+                source.isCurrentSource = ASIOTrue;
+                strncpy_s(source.name, "Internal", _TRUNCATE);
+                clocks[0] = source;
+            }
             return ASE_OK;
         }
-
-        if (numSources) *numSources = 1;
-        if (clocks) {
-            ASIOClockSource source = {};
-            source.index = 0;
-            source.associatedChannel = -1;
-            source.associatedGroup = -1;
-            source.isCurrentSource = ASIOTrue;
-            strncpy_s(source.name, "Internal", _TRUNCATE);
-            clocks[0] = source;
-        }
-        return ASE_OK;
+        if (!m_hwAsio) return ASE_NotPresent;
+        return m_hwAsio->getClockSources(clocks, numSources);
     }
 
     ASIOError setClockSource(long reference) override {
-        if (m_hwAsio) return m_hwAsio->setClockSource(reference);
-        if (m_entry.role == DriverRole::Tap && reference == 0) return ASE_OK;
-        return ASE_InvalidParameter;
+        if (m_entry.role == DriverRole::Tap) {
+            return reference == 0 ? ASE_OK : ASE_InvalidParameter;
+        }
+        if (!m_hwAsio) return ASE_NotPresent;
+        return m_hwAsio->setClockSource(reference);
     }
 
     ASIOError getSamplePosition(ASIOSamples* sPos, ASIOTimeStamp* tStamp) override {
-        if (m_hwAsio) return m_hwAsio->getSamplePosition(sPos, tStamp);
-        if (m_entry.role != DriverRole::Tap) {
+        if (m_entry.role == DriverRole::Tap) {
+            const uint64_t position = m_samplePos.load(std::memory_order_relaxed);
             if (sPos) {
-                sPos->hi = 0;
-                sPos->lo = 0;
+                sPos->hi = static_cast<unsigned long>(position >> 32);
+                sPos->lo = static_cast<unsigned long>(position & 0xFFFFFFFFu);
             }
             if (tStamp) {
-                tStamp->hi = 0;
-                tStamp->lo = 0;
+                const uint64_t now = QpcNanoseconds();
+                tStamp->hi = static_cast<unsigned long>(now >> 32);
+                tStamp->lo = static_cast<unsigned long>(now & 0xFFFFFFFFu);
             }
             return ASE_OK;
         }
-
-        const uint64_t position = m_samplePos.load(std::memory_order_relaxed);
-        if (sPos) {
-            sPos->hi = static_cast<unsigned long>(position >> 32);
-            sPos->lo = static_cast<unsigned long>(position & 0xFFFFFFFFu);
-        }
-        if (tStamp) {
-            const uint64_t now = QpcNanoseconds();
-            tStamp->hi = static_cast<unsigned long>(now >> 32);
-            tStamp->lo = static_cast<unsigned long>(now & 0xFFFFFFFFu);
-        }
-        return ASE_OK;
+        if (!m_hwAsio) return ASE_NotPresent;
+        return m_hwAsio->getSamplePosition(sPos, tStamp);
     }
 
     ASIOError getChannelInfo(ASIOChannelInfo* info) override {
-        if (m_hwAsio) return m_hwAsio->getChannelInfo(info);
         if (!info) return ASE_InvalidParameter;
-
         if (m_entry.role == DriverRole::Tap) {
             if (!info->isInput || info->channel < 0 || info->channel >= 2) return ASE_InvalidParameter;
             info->isActive = ASIOTrue;
@@ -349,12 +440,8 @@ public:
             strncpy_s(info->name, info->channel == 0 ? "Tap 1" : "Tap 2", _TRUNCATE);
             return ASE_OK;
         }
-
-        info->isActive = ASIOFalse;
-        info->channelGroup = 0;
-        info->type = ASIOSTFloat32LSB;
-        std::memcpy(info->name, "Channel", sizeof("Channel"));
-        return ASE_OK;
+        if (!m_hwAsio) return ASE_NotPresent;
+        return m_hwAsio->getChannelInfo(info);
     }
 
     ASIOError createBuffers(ASIOBufferInfo* bufferInfos, long numChannels, long bufferSize,
@@ -410,6 +497,7 @@ public:
             block->outputChannels.store(static_cast<uint32_t>(m_outCount), std::memory_order_relaxed);
             ASIOSampleRate rate = 0.0;
             if (m_hwAsio->getSampleRate(&rate) == ASE_OK) publishRate(rate);
+            block->generation.fetch_add(1, std::memory_order_release);
         }
         return ASE_OK;
     }
@@ -419,25 +507,25 @@ public:
             stopTapWorker();
             freeTapBuffers();
             m_hostCallbacks = {};
+            m_tapUseTimeInfo = false;
             m_buffersCreated = false;
             return ASE_OK;
+        }
+
+        if (m_isPublisher && m_shm.block()) {
+            m_shm.block()->masterStreaming.store(0, std::memory_order_release);
+        }
+        m_started = false;
+
+        ASIOError result = ASE_OK;
+        if (m_hwAsio && m_buffersCreated) {
+            m_hwAsio->stop();
+            result = m_hwAsio->disposeBuffers();
         }
 
         s_activeMaster.store(nullptr, std::memory_order_release);
         m_hostCallbacks = {};
-        if (m_isPublisher && m_shm.block()) {
-            m_shm.block()->masterStreaming.store(0, std::memory_order_release);
-        }
         m_outCount = 0;
-
-        if (!m_hwAsio || !m_buffersCreated) {
-            m_buffersCreated = false;
-            return ASE_OK;
-        }
-
-        m_started = false;
-        m_hwAsio->stop();
-        const ASIOError result = m_hwAsio->disposeBuffers();
         m_buffersCreated = false;
         return result;
     }
@@ -451,23 +539,12 @@ public:
     }
 
     ASIOError future(long selector, void* opt) override {
-        if (m_hwAsio) {
-            if (selector == kAsioSelectorSupported &&
-                static_cast<long>(reinterpret_cast<intptr_t>(opt)) == kAsioResetRequest) {
-                return ASIOTrue;
-            }
-            return m_hwAsio->future(selector, opt);
-        }
-
         if (m_entry.role == DriverRole::Tap) {
             switch (selector) {
                 case kAsioEngineVersion:
                     return 2;
                 case kAsioCanTimeInfo:
                     return ASE_SUCCESS;
-                case kAsioCanTimeCode:
-                case kAsioCanInputMonitor:
-                    return ASE_NotPresent;
                 case kAsioSelectorSupported:
                     switch (static_cast<long>(reinterpret_cast<intptr_t>(opt))) {
                         case kAsioEngineVersion:
@@ -484,20 +561,12 @@ public:
                     return ASE_NotPresent;
             }
         }
-
-        switch (selector) {
-            case kAsioEngineVersion:
-                return 2;
-            case kAsioSelectorSupported:
-                switch (static_cast<long>(reinterpret_cast<intptr_t>(opt))) {
-                    case kAsioResetRequest:
-                        return ASIOTrue;
-                    default:
-                        return ASIOFalse;
-                }
-            default:
-                return ASE_NotPresent;
+        if (!m_hwAsio) return ASE_NotPresent;
+        if (selector == kAsioSelectorSupported &&
+            static_cast<long>(reinterpret_cast<intptr_t>(opt)) == kAsioResetRequest) {
+            return ASIOTrue;
         }
+        return m_hwAsio->future(selector, opt);
     }
 
     ASIOError outputReady() override {
@@ -506,7 +575,6 @@ public:
     }
 
 private:
-    // ---- hardware -> host trampolines (ASIOCallbacks has no userData) ----
     static void onHardwareBufferSwitch(long doubleBufferIndex, ASIOBool directProcess) {
         MyAsioSplitter* self = s_activeMaster.load(std::memory_order_acquire);
         if (!self) return;
@@ -548,11 +616,9 @@ private:
         return 0;
     }
 
-    // ---- tap publisher (master) ----
     void publishTap(long doubleBufferIndex) {
         ShmBlock* block = m_shm.block();
         if (!block || !m_isPublisher || m_outCount <= 0 || m_bufferSize <= 0) return;
-        // Zero audio-thread work when no tap client is attached.
         if (block->tapClients.load(std::memory_order_acquire) == 0) return;
 
         const void* left = m_outChannels[0].buffers[doubleBufferIndex];
@@ -566,19 +632,23 @@ private:
         if (used > kRingFrames) used = kRingFrames;
         const uint64_t space = kRingFrames - used;
         const long count = static_cast<uint64_t>(frames) < space ? frames : static_cast<long>(space);
+        if (count <= 0) return;
+
+        const uint64_t pos = write & kRingMask;
+        const long part1 = static_cast<long>(std::min<uint64_t>(static_cast<uint64_t>(count), kRingFrames - pos));
+        const long part2 = count - part1;
 
         const ASIOSampleType leftType = m_outChannels[0].type;
         const ASIOSampleType rightType = m_outCount > 1 ? m_outChannels[1].type : leftType;
-        for (long i = 0; i < count; ++i) {
-            const float l = ReadSampleAsFloat(leftType, left, i);
-            const float r = ReadSampleAsFloat(rightType, right, i);
-            const uint64_t index = (write + static_cast<uint64_t>(i)) & kRingMask;
-            block->samples[index * 2] = l;
-            block->samples[index * 2 + 1] = r;
+
+        WriteChannelSamples(leftType, left, 0, &block->samples[pos * 2], part1);
+        WriteChannelSamples(rightType, right, 0, &block->samples[pos * 2 + 1], part1);
+        if (part2 > 0) {
+            WriteChannelSamples(leftType, left, part1, &block->samples[0], part2);
+            WriteChannelSamples(rightType, right, part1, &block->samples[1], part2);
         }
-        if (count > 0) {
-            block->writeIdx.store(write + static_cast<uint64_t>(count), std::memory_order_release);
-        }
+
+        block->writeIdx.store(write + static_cast<uint64_t>(count), std::memory_order_release);
     }
 
     bool claimMaster() {
@@ -624,7 +694,6 @@ private:
         }
     }
 
-    // ---- tap consumer (slave) ----
     ASIOBool initTap() {
         m_shm.Attach();
         ShmBlock* block = m_shm.block();
@@ -683,13 +752,16 @@ private:
         }
         if (m_buffersCreated) return ASE_InvalidMode;
 
-        long channels = 0;
-        for (long i = 0; i < numChannels && channels < 2; ++i) {
-            if (bufferInfos[i].isInput) ++channels;
-        }
-        if (channels == 0) return ASE_InvalidParameter;
+        freeTapBuffers();
 
-        for (long ch = 0; ch < channels; ++ch) {
+        long channels = 0;
+        for (long i = 0; i < numChannels; ++i) {
+            if (!bufferInfos[i].isInput) continue;
+            const long ch = bufferInfos[i].channelNum;
+            if (ch < 0 || ch >= 2 || m_tapActive[ch]) {
+                freeTapBuffers();
+                return ASE_InvalidParameter;
+            }
             const size_t bytes = static_cast<size_t>(bufferSize) * sizeof(float);
             m_tapBuffer[ch][0] = static_cast<float*>(_aligned_malloc(bytes, 64));
             m_tapBuffer[ch][1] = static_cast<float*>(_aligned_malloc(bytes, 64));
@@ -699,47 +771,42 @@ private:
             }
             std::memset(m_tapBuffer[ch][0], 0, bytes);
             std::memset(m_tapBuffer[ch][1], 0, bytes);
+            bufferInfos[i].buffers[0] = m_tapBuffer[ch][0];
+            bufferInfos[i].buffers[1] = m_tapBuffer[ch][1];
+            m_tapActive[ch] = true;
+            ++channels;
         }
+        if (channels == 0) return ASE_InvalidParameter;
 
-        long mapped = 0;
-        for (long i = 0; i < numChannels && mapped < channels; ++i) {
-            if (!bufferInfos[i].isInput) continue;
-            bufferInfos[i].buffers[0] = m_tapBuffer[mapped][0];
-            bufferInfos[i].buffers[1] = m_tapBuffer[mapped][1];
-            ++mapped;
-        }
-
-        m_tapChannels = channels;
         m_tapBufferSize = bufferSize;
         m_hostCallbacks = *callbacks;
         m_buffersCreated = true;
+        m_tapUseTimeInfo = m_hostCallbacks.asioMessage &&
+                           m_hostCallbacks.asioMessage(kAsioSupportsTimeInfo, 0, nullptr, nullptr) == 1;
 
         if (ShmBlock* block = m_shm.block()) {
             block->readIdx.store(block->writeIdx.load(std::memory_order_acquire),
                                  std::memory_order_release);
         }
-
-        if (m_hostCallbacks.asioMessage) {
-            m_hostCallbacks.asioMessage(kAsioSupportsTimeInfo, ASIOTrue, nullptr, nullptr);
-        }
         return ASE_OK;
     }
 
     void freeTapBuffers() {
-        for (auto& channel : m_tapBuffer) {
-            for (float*& buffer : channel) {
+        for (int ch = 0; ch < 2; ++ch) {
+            m_tapActive[ch] = false;
+            for (float*& buffer : m_tapBuffer[ch]) {
                 if (buffer) {
                     _aligned_free(buffer);
                     buffer = nullptr;
                 }
             }
         }
-        m_tapChannels = 0;
         m_tapBufferSize = 0;
     }
 
     ASIOError startTapWorker() {
-        if (!m_buffersCreated || m_tapChannels == 0 || !m_hostCallbacks.bufferSwitch) {
+        if (!m_buffersCreated || (!m_tapActive[0] && !m_tapActive[1]) ||
+            (!m_hostCallbacks.bufferSwitch && !m_hostCallbacks.bufferSwitchTimeInfo)) {
             return ASE_InvalidMode;
         }
         if (m_worker.joinable()) return ASE_OK;
@@ -776,16 +843,17 @@ private:
                                               TIMER_ALL_ACCESS);
         if (!timer) timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
 
-        LARGE_INTEGER frequency = {};
-        QueryPerformanceFrequency(&frequency);
-        const double qpcHz = frequency.QuadPart > 0 ? static_cast<double>(frequency.QuadPart) : 1.0;
-
+        const double qpcHz = static_cast<double>(QpcFrequency());
         ShmBlock* block = m_shm.block();
         uint32_t lastGeneration = block ? block->generation.load(std::memory_order_acquire) : 0;
 
         bool waitingForFill = true;
+        bool wasAudioActive = false;
+        float lastSample[2] = {0.0f, 0.0f};
         long doubleBuffer = 0;
         bool firstTick = true;
+        double lastRate = liveTapRate();
+
         LARGE_INTEGER now = {};
         QueryPerformanceCounter(&now);
         double targetQpc = static_cast<double>(now.QuadPart);
@@ -794,20 +862,30 @@ private:
             bool streaming = false;
             double rate = m_sampleRate;
             uint64_t write = 0;
+            long masterBuf = 0;
 
             if (block) {
                 const uint32_t generation = block->generation.load(std::memory_order_acquire);
                 streaming = block->masterStreaming.load(std::memory_order_acquire) != 0;
+                masterBuf = static_cast<long>(block->bufferSize.load(std::memory_order_acquire));
                 const double sharedRate =
                     SampleRateFromBits(block->sampleRateBits.load(std::memory_order_acquire));
                 if (sharedRate >= 8000.0 && sharedRate <= 384000.0) rate = sharedRate;
                 write = block->writeIdx.load(std::memory_order_acquire);
 
-                uint64_t read = block->readIdx.load(std::memory_order_relaxed);
+                const uint64_t read = block->readIdx.load(std::memory_order_relaxed);
                 if (generation != lastGeneration || write < read || write - read > kRingFrames) {
                     block->readIdx.store(write, std::memory_order_release);
                     lastGeneration = generation;
                     waitingForFill = true;
+                }
+            }
+
+            if (streaming && std::fabs(rate - lastRate) >= 0.5) {
+                lastRate = rate;
+                m_sampleRate = rate;
+                if (m_hostCallbacks.sampleRateDidChange) {
+                    m_hostCallbacks.sampleRateDidChange(rate);
                 }
             }
 
@@ -818,7 +896,10 @@ private:
             if (available > kRingFrames) available = 0;
 
             const long frames = m_tapBufferSize;
-            long targetFill = frames * 3;
+            const long minTimeFrames = static_cast<long>((rate > 0.0 ? rate : 48000.0) * 0.008);
+            long targetFill = frames * 2;
+            if (masterBuf * 2 > targetFill) targetFill = masterBuf * 2;
+            if (minTimeFrames > targetFill) targetFill = minTimeFrames;
             const long maxFill = static_cast<long>(kRingFrames / 2);
             if (targetFill > maxFill) targetFill = maxFill;
             if (targetFill < frames) targetFill = frames;
@@ -829,42 +910,41 @@ private:
 
             if (!firstTick) {
                 double adjust = 1.0;
-                if (!waitingForFill) {
-                    double errorRatio = 0.0;
-                    if (frames > 0) {
-                        errorRatio = (static_cast<double>(available) - static_cast<double>(targetFill)) /
-                                     static_cast<double>(frames);
-                        if (errorRatio > 1.0) errorRatio = 1.0;
-                        if (errorRatio < -1.0) errorRatio = -1.0;
-                    }
-                    // Too much buffered -> consume a little faster; too little -> slower.
+                if (!waitingForFill && frames > 0) {
+                    double errorRatio = (static_cast<double>(available) - static_cast<double>(targetFill)) /
+                                        static_cast<double>(frames);
+                    if (errorRatio > 1.0) errorRatio = 1.0;
+                    if (errorRatio < -1.0) errorRatio = -1.0;
                     adjust = 1.0 - 0.04 * errorRatio;
                 }
 
-                const double periodSeconds = static_cast<double>(frames) / (rate > 0.0 ? rate : 48000.0);
-                targetQpc += periodSeconds * adjust * qpcHz;
+                const double periodTicks =
+                    (static_cast<double>(frames) / (rate > 0.0 ? rate : 48000.0)) * qpcHz;
+                targetQpc += periodTicks * adjust;
                 QueryPerformanceCounter(&now);
                 double waitTicks = targetQpc - static_cast<double>(now.QuadPart);
-                if (waitTicks < 0.0) {
+                if (waitTicks < -2.0 * periodTicks) {
                     targetQpc = static_cast<double>(now.QuadPart);
                     waitTicks = 0.0;
                 }
 
-                LONGLONG due100ns = static_cast<LONGLONG>(waitTicks * 10000000.0 / qpcHz);
-                if (due100ns < 1) due100ns = 1;
-                LARGE_INTEGER due = {};
-                due.QuadPart = -due100ns;
-
-                if (!SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
-                    Sleep(1);
-                } else {
-                    HANDLE handles[2] = {timer, m_workerWakeEvent};
-                    const DWORD waitResult =
-                        WaitForMultipleObjects(m_workerWakeEvent ? 2 : 1, handles, FALSE, INFINITE);
-                    if (m_workerWakeEvent && waitResult == WAIT_OBJECT_0 + 1) break;
-                    if (waitResult != WAIT_OBJECT_0 &&
-                        !m_workerStop.load(std::memory_order_relaxed)) {
-                        Sleep(1);
+                if (waitTicks > 0.0) {
+                    const LONGLONG due100ns = static_cast<LONGLONG>(waitTicks * 10000000.0 / qpcHz);
+                    if (due100ns >= 1) {
+                        LARGE_INTEGER due = {};
+                        due.QuadPart = -due100ns;
+                        if (!SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+                            Sleep(1);
+                        } else {
+                            HANDLE handles[2] = {timer, m_workerWakeEvent};
+                            const DWORD waitResult =
+                                WaitForMultipleObjects(m_workerWakeEvent ? 2 : 1, handles, FALSE, INFINITE);
+                            if (m_workerWakeEvent && waitResult == WAIT_OBJECT_0 + 1) break;
+                            if (waitResult != WAIT_OBJECT_0 &&
+                                !m_workerStop.load(std::memory_order_relaxed)) {
+                                Sleep(1);
+                            }
+                        }
                     }
                 }
             }
@@ -875,10 +955,15 @@ private:
             if (block) {
                 write = block->writeIdx.load(std::memory_order_acquire);
                 read = block->readIdx.load(std::memory_order_relaxed);
+                const uint64_t maxLag =
+                    static_cast<uint64_t>(targetFill) + static_cast<uint64_t>(frames) * 8;
                 if (write < read || write - read > kRingFrames) {
                     block->readIdx.store(write, std::memory_order_release);
                     waitingForFill = true;
                     read = write;
+                } else if (!waitingForFill && (write - read) > maxLag) {
+                    read = write - static_cast<uint64_t>(targetFill);
+                    block->readIdx.store(read, std::memory_order_release);
                 }
                 available = write - read;
             } else {
@@ -891,24 +976,52 @@ private:
             if (available < static_cast<uint64_t>(frames)) waitingForFill = true;
 
             const bool haveData = streaming && !waitingForFill && block && available >= static_cast<uint64_t>(frames);
+            const long fadeLen = frames < 32L ? frames : 32L;
 
-            for (long ch = 0; ch < m_tapChannels; ++ch) {
+            for (long ch = 0; ch < 2; ++ch) {
+                if (!m_tapActive[ch]) continue;
                 float* destination = m_tapBuffer[ch][doubleBuffer];
+
                 if (!haveData) {
                     std::memset(destination, 0, static_cast<size_t>(frames) * sizeof(float));
+                    if (wasAudioActive && lastSample[ch] != 0.0f) {
+                        for (long i = 0; i < fadeLen; ++i) {
+                            const float gain = 1.0f - static_cast<float>(i + 1) / static_cast<float>(fadeLen);
+                            destination[i] = lastSample[ch] * gain;
+                        }
+                    }
+                    lastSample[ch] = 0.0f;
                     continue;
                 }
-                for (long i = 0; i < frames; ++i) {
-                    const uint64_t index = (read + static_cast<uint64_t>(i)) & kRingMask;
-                    destination[i] = block->samples[index * 2 + static_cast<uint64_t>(ch)];
+
+                const uint64_t pos = read & kRingMask;
+                const long part1 =
+                    static_cast<long>(std::min<uint64_t>(static_cast<uint64_t>(frames), kRingFrames - pos));
+                const long part2 = frames - part1;
+
+                const float* src1 = &block->samples[pos * 2 + static_cast<size_t>(ch)];
+                for (long i = 0; i < part1; ++i) {
+                    destination[i] = src1[i * 2];
                 }
+                if (part2 > 0) {
+                    const float* src2 = &block->samples[static_cast<size_t>(ch)];
+                    for (long i = 0; i < part2; ++i) {
+                        destination[part1 + i] = src2[i * 2];
+                    }
+                }
+
+                if (!wasAudioActive) {
+                    for (long i = 0; i < fadeLen; ++i) {
+                        destination[i] *= static_cast<float>(i + 1) / static_cast<float>(fadeLen);
+                    }
+                }
+                lastSample[ch] = destination[frames - 1];
             }
+            wasAudioActive = haveData;
 
             if (haveData) {
                 block->readIdx.store(read + static_cast<uint64_t>(frames), std::memory_order_release);
             } else if (block && !streaming) {
-                // Master idle: drop whatever is left. When streaming but still
-                // priming, keep readIdx put so the ring can actually fill.
                 block->readIdx.store(write, std::memory_order_release);
             }
 
@@ -916,7 +1029,8 @@ private:
             const uint64_t timeStamp = QpcNanoseconds();
             ASIOTime time = {};
             time.timeInfo.speed = 1.0;
-            time.timeInfo.samplePosition = static_cast<unsigned long>(position & 0xFFFFFFFFu);
+            time.timeInfo.samplePosition.hi = static_cast<unsigned long>(position >> 32);
+            time.timeInfo.samplePosition.lo = static_cast<unsigned long>(position & 0xFFFFFFFFu);
             time.timeInfo.sampleRate = rate;
             time.timeInfo.flags =
                 kSystemTimeValid | kSamplePositionValid | kSampleRateValid | kSpeedValid;
@@ -924,7 +1038,7 @@ private:
             time.timeInfo.systemTime.lo = static_cast<unsigned long>(timeStamp & 0xFFFFFFFFu);
             time.timeCode.speed = 1.0;
 
-            if (m_hostCallbacks.bufferSwitchTimeInfo) {
+            if (m_tapUseTimeInfo && m_hostCallbacks.bufferSwitchTimeInfo) {
                 m_hostCallbacks.bufferSwitchTimeInfo(&time, doubleBuffer, ASIOFalse);
             } else if (m_hostCallbacks.bufferSwitch) {
                 m_hostCallbacks.bufferSwitch(doubleBuffer, ASIOFalse);
@@ -938,7 +1052,6 @@ private:
         if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
     }
 
-    // ---- lifecycle helpers ----
     bool openHardware(REFCLSID clsid, void* sysHandle) {
         IASIO* hardware = nullptr;
         const HRESULT hr = CoCreateInstance(clsid, nullptr, CLSCTX_INPROC_SERVER, clsid,
@@ -985,25 +1098,32 @@ private:
             stopTapWorker();
             freeTapBuffers();
             m_hostCallbacks = {};
+            m_tapUseTimeInfo = false;
             m_buffersCreated = false;
+            m_samplePos.store(0, std::memory_order_relaxed);
             if (m_tapRegistered && m_shm.block()) {
                 m_shm.block()->tapClients.fetch_sub(1, std::memory_order_acq_rel);
             }
             m_tapRegistered = false;
             m_shm.Detach();
+            setError("MyASIO Splitter: no error.");
             return;
         }
 
-        s_activeMaster.store(nullptr, std::memory_order_release);
-        m_hostCallbacks = {};
-        m_outCount = 0;
+        if (m_isPublisher && m_shm.block()) {
+            m_shm.block()->masterStreaming.store(0, std::memory_order_release);
+        }
+        m_started = false;
 
         if (m_buffersCreated && m_hwAsio) {
             m_hwAsio->stop();
             m_hwAsio->disposeBuffers();
             m_buffersCreated = false;
         }
-        m_started = false;
+
+        s_activeMaster.store(nullptr, std::memory_order_release);
+        m_hostCallbacks = {};
+        m_outCount = 0;
 
         releaseMaster();
 
@@ -1012,6 +1132,7 @@ private:
             m_hwAsio = nullptr;
         }
         m_shm.Detach();
+        setError("MyASIO Splitter: no error.");
     }
 
     void setError(const char* message) { strncpy_s(m_lastError, message, _TRUNCATE); }
@@ -1024,6 +1145,7 @@ private:
     }
 
     const DriverEntry& m_entry;
+    std::atomic<long> m_ref{0};
     IASIO* m_hwAsio = nullptr;
     ASIOCallbacks m_hostCallbacks = {};
     ASIOCallbacks m_hwCallbacks = {};
@@ -1040,7 +1162,8 @@ private:
     long m_outCount = 0;
 
     float* m_tapBuffer[2][2] = {};
-    long m_tapChannels = 0;
+    bool m_tapActive[2] = {};
+    bool m_tapUseTimeInfo = false;
     long m_tapBufferSize = 0;
     long m_tapFallbackBuffer = 512;
     std::thread m_worker;
@@ -1054,7 +1177,6 @@ private:
 std::atomic<MyAsioSplitter*> MyAsioSplitter::s_activeMaster{nullptr};
 
 static MyAsioSplitter& DriverInstance(const DriverEntry& entry) {
-    // One object per role, per host process, shared by every CoCreateInstance.
     static MyAsioSplitter* master = new MyAsioSplitter(kDrivers[0]);
     static MyAsioSplitter* tap = new MyAsioSplitter(kDrivers[1]);
     return entry.role == DriverRole::Tap ? *tap : *master;
@@ -1075,10 +1197,12 @@ public:
         return E_NOINTERFACE;
     }
 
-    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&m_ref)); }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return static_cast<ULONG>(m_ref.fetch_add(1, std::memory_order_relaxed) + 1);
+    }
 
     ULONG STDMETHODCALLTYPE Release() override {
-        const LONG refs = InterlockedDecrement(&m_ref);
+        const long refs = m_ref.fetch_sub(1, std::memory_order_acq_rel) - 1;
         if (refs == 0) delete this;
         return static_cast<ULONG>(refs < 0 ? 0 : refs);
     }
@@ -1097,16 +1221,16 @@ public:
 
     HRESULT STDMETHODCALLTYPE LockServer(BOOL lock) override {
         if (lock) {
-            InterlockedIncrement(&g_serverLocks);
+            g_serverLocks.fetch_add(1, std::memory_order_relaxed);
         } else {
-            InterlockedDecrement(&g_serverLocks);
+            g_serverLocks.fetch_sub(1, std::memory_order_relaxed);
         }
         return S_OK;
     }
 
 private:
     const DriverEntry& m_entry;
-    LONG m_ref = 1;
+    std::atomic<long> m_ref{1};
 };
 
 static HRESULT SetRegString(HKEY root, const wchar_t* subKey, const wchar_t* value, const wchar_t* data) {
@@ -1147,7 +1271,10 @@ extern "C" STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, void** ppv) {
 }
 
 extern "C" STDAPI DllCanUnloadNow() {
-    return (g_driverRefs == 0 && g_serverLocks == 0) ? S_OK : S_FALSE;
+    return (g_liveObjects.load(std::memory_order_acquire) == 0 &&
+            g_serverLocks.load(std::memory_order_acquire) == 0)
+               ? S_OK
+               : S_FALSE;
 }
 
 extern "C" STDAPI DllRegisterServer() {

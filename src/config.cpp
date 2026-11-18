@@ -11,6 +11,14 @@ constexpr wchar_t kIniKey[] = L"CLSID";
 constexpr wchar_t kPickerClass[] = L"MyAsioSplitterPicker";
 constexpr int kComboId = 1000;
 
+HMODULE SelfModule() {
+    HMODULE module = nullptr;
+    GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&SelfModule), &module);
+    return module;
+}
+
 std::wstring Trim(std::wstring text) {
     const size_t first = text.find_first_not_of(L" \t\r\n");
     if (first == std::wstring::npos) return {};
@@ -66,7 +74,7 @@ LRESULT CALLBACK PickerProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             state = static_cast<PickerState*>(create->lpCreateParams);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
 
-            HINSTANCE instance = GetModuleHandleW(nullptr);
+            HINSTANCE instance = create->hInstance;
             HWND label = CreateWindowExW(0, L"STATIC", L"Select hardware ASIO device:", WS_CHILD | WS_VISIBLE,
                                          12, 12, 340, 20, hwnd, nullptr, instance, nullptr);
             state->combo = CreateWindowExW(
@@ -125,7 +133,7 @@ LRESULT CALLBACK PickerProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
-}  // namespace
+}
 
 std::vector<AsioDriverInfo> EnumerateAsioDrivers(REFCLSID exclude1, REFCLSID exclude2) {
     std::vector<AsioDriverInfo> drivers;
@@ -183,10 +191,11 @@ bool SaveSelectedClsid(REFCLSID clsid) {
 int ShowAsioDevicePicker(const std::vector<AsioDriverInfo>& drivers, const CLSID* preselect) {
     if (drivers.empty()) return -1;
 
+    HINSTANCE self = SelfModule();
     WNDCLASSEXW windowClass = {};
     windowClass.cbSize = sizeof(windowClass);
     windowClass.lpfnWndProc = PickerProc;
-    windowClass.hInstance = GetModuleHandleW(nullptr);
+    windowClass.hInstance = self;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
     windowClass.lpszClassName = kPickerClass;
@@ -206,8 +215,11 @@ int ShowAsioDevicePicker(const std::vector<AsioDriverInfo>& drivers, const CLSID
     HWND owner = GetActiveWindow();
     HWND hwnd = CreateWindowExW(WS_EX_CONTROLPARENT, kPickerClass,
                                 L"MyASIO Splitter - Select ASIO Device", style, x, y, width, height,
-                                owner, nullptr, windowClass.hInstance, &state);
-    if (!hwnd) return -1;
+                                owner, nullptr, self, &state);
+    if (!hwnd) {
+        UnregisterClassW(kPickerClass, self);
+        return -1;
+    }
 
     if (owner && owner != hwnd) EnableWindow(owner, FALSE);
     ShowWindow(hwnd, SW_SHOW);
@@ -239,6 +251,7 @@ int ShowAsioDevicePicker(const std::vector<AsioDriverInfo>& drivers, const CLSID
     }
 
     if (IsWindow(hwnd)) DestroyWindow(hwnd);
+    UnregisterClassW(kPickerClass, self);
     if (owner && IsWindow(owner)) {
         EnableWindow(owner, TRUE);
         SetActiveWindow(owner);

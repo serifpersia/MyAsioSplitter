@@ -1,5 +1,3 @@
-// Steinberg ASIO 2.3 binary ABI, declared locally (no ASIO SDK dependency).
-// x64 MSVC layout: IASIO non-IUnknown methods use __cdecl, IUnknown uses __stdcall.
 #pragma once
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -21,7 +19,6 @@ typedef long ASIOBool;
 typedef long ASIOError;
 typedef double ASIOSampleRate;
 
-// ASIOError values
 constexpr ASIOError ASE_OK = 0;
 constexpr ASIOError ASE_SUCCESS = 0x3f4847a0L;
 constexpr ASIOError ASE_NotPresent = -1000;
@@ -86,7 +83,7 @@ typedef struct ASIOChannelInfo {
 typedef struct ASIOTimeInfo {
     double speed;
     ASIOTimeStamp systemTime;
-    unsigned long samplePosition;
+    ASIOSamples samplePosition;
     ASIOSampleRate sampleRate;
     unsigned long flags;
     char reserved[12];
@@ -94,7 +91,7 @@ typedef struct ASIOTimeInfo {
 
 typedef struct ASIOTimeCode {
     double speed;
-    ASIOTimeStamp timeCodeSamples;
+    ASIOSamples timeCodeSamples;
     unsigned long flags;
     char future[64];
 } ASIOTimeCode;
@@ -113,7 +110,6 @@ typedef struct ASIOClockSource {
     char name[32];
 } ASIOClockSource;
 
-// ASIOTimeInfo::flags
 constexpr unsigned long kSystemTimeValid = 1;
 constexpr unsigned long kSamplePositionValid = 2;
 constexpr unsigned long kSampleRateValid = 4;
@@ -121,7 +117,6 @@ constexpr unsigned long kSpeedValid = 8;
 constexpr unsigned long kSampleRateChanged = 16;
 constexpr unsigned long kClockSourceChanged = 32;
 
-// asioMessage selectors
 constexpr long kAsioSelectorSupported = 1;
 constexpr long kAsioEngineVersion = 2;
 constexpr long kAsioResetRequest = 3;
@@ -138,7 +133,6 @@ constexpr long kAsioSupportsOutputGain = 13;
 constexpr long kAsioSupportsOutputMeter = 14;
 constexpr long kAsioOverload = 15;
 
-// ASIOFuture selectors (IASIO::future)
 constexpr long kAsioEnableTimeCodeRead = 1;
 constexpr long kAsioDisableTimeCodeRead = 2;
 constexpr long kAsioSetInputMonitor = 3;
@@ -160,9 +154,14 @@ typedef struct ASIOCallbacks {
 
 #pragma pack(pop)
 
-// Exact Steinberg IASIO vtable order: 21 IASIO methods, preceded by IUnknown's
-// QueryInterface/AddRef/Release = 24 slots. There must be NO virtual destructor;
-// a virtual ~IASIO() injects a deleting destructor and shifts every vtable slot.
+static_assert(sizeof(ASIOBufferInfo) == 24);
+static_assert(sizeof(ASIOChannelInfo) == 52);
+static_assert(sizeof(ASIOClockSource) == 48);
+static_assert(sizeof(ASIOTimeInfo) == 48);
+static_assert(sizeof(ASIOTimeCode) == 84);
+static_assert(sizeof(ASIOTime) == 148);
+static_assert(sizeof(ASIOCallbacks) == 32);
+
 interface IASIO : public IUnknown {
     virtual ASIOBool init(void* sysHandle) = 0;
     virtual void getDriverName(char* name) = 0;
