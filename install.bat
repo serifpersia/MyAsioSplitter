@@ -66,6 +66,7 @@ call :unregister
 if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
 copy /y "%SOURCE_DLL%" "%INSTALL_DLL%" >nul
 if errorlevel 1 (
+    if exist "%INSTALL_DLL%" "%REGSVR32%" /s "%INSTALL_DLL%" >nul 2>&1
     echo Could not copy the DLL. Close any application using it and try again.
     goto fail
 )

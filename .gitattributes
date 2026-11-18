@@ -1,0 +1,2 @@
+*.bat text eol=crlf
+*.def text eol=crlf
